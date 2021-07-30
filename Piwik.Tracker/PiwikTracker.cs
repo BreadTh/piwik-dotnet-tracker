@@ -11,7 +11,6 @@
 
 namespace Piwik.Tracker
 {
-    using System.IO;
     using System;
     using System.Collections.Generic;
     using System.Linq;
@@ -42,7 +41,6 @@ namespace Piwik.Tracker
     ///      $t->setBrowserLanguage('fr');
     ///      $t->setLocalTime( '12:34:06' );
     ///      $t->setResolution( 1024, 768 );
-    ///      $t->setBrowserHasCookies(true);
     ///      $t->setPlugins($flash = true, $java = true, $director = false);
     ///
     ///      // set a Custom Variable called 'Gender'
@@ -119,11 +117,6 @@ namespace Piwik.Tracker
 	    private const string DefaultCharsetParameterValues = "utf-8";
 
         /// <summary>
-        /// <see cref="http://developer.piwik.org/api-reference/tracking-javascript"/>
-        /// </summary>
-        private const string FirstPartyCookiesPrefix = "_pk_";
-
-        /// <summary>
         /// Ecommerce item page view tracking stores item's metadata in these Custom Variables slots.
         /// </summary>
         internal const int CvarIndexEcommerceItemPrice = 2;
@@ -132,23 +125,11 @@ namespace Piwik.Tracker
         internal const int CvarIndexEcommerceItemName = 4;
         internal const int CvarIndexEcommerceItemCategory = 5;
 
-        private const string DefaultCookiePath = "/";
-
-        // Life of the visitor cookie (in sec)
-        private const int ConfigVisitorCookieTimeout = 33955200;
-
-        // Life of the session cookie (in sec)
-        private const int ConfigSessionCookieTimeout = 1800; // 30 minutes
-
-        // Life of the session cookie (in sec)
-        private const int ConfigReferralCookieTimeout = 15768000; // 6 months
-
         private string _debugAppendUrl;
         private string _userAgent;
         private DateTimeOffset _localTime = DateTimeOffset.MinValue;
-        private bool _hasCookies;
         private string _plugins;
-        private Dictionary<string, string[]> _visitorCustomVar;
+        private Dictionary<string, string[]> _visitorCustomVar = new Dictionary<string, string[]>();
         private Dictionary<string, string[]> _pageCustomVar = new Dictionary<string, string[]>();
         private Dictionary<string, string[]> _eventCustomVar = new Dictionary<string, string[]>();
         private Dictionary<string, string> _customParameters = new Dictionary<string, string>();
@@ -166,7 +147,6 @@ namespace Piwik.Tracker
         private string _acceptLanguage;
         private string _userId;
         private string _forcedVisitorId;
-        private string _cookieVisitorId;
         private string _randomVisitorId;
         private int _width;
         private int _height;
@@ -178,11 +158,6 @@ namespace Piwik.Tracker
         private float? _latitude;
         private float? _longitude;
 
-        private bool _configCookiesDisabled;
-        private string _configCookiePath = DefaultCookiePath;
-        private string _configCookieDomain = "";
-        private readonly long _currentTs = (long)(DateTime.UtcNow - DateTimeUtils.UnixEpoch).TotalSeconds;
-        private long _createTs;
         private bool _sendImageResponse = true;
 
         private readonly IHttpContextAccessor _httpContextAccessor;
@@ -217,8 +192,6 @@ namespace Piwik.Tracker
 
             _pageUrl = GetCurrentUrl();
             SetNewVisitorId();
-            _createTs = _currentTs;
-            _visitorCustomVar = GetCustomVariablesFromCookie();
         }
 
         /// <summary>
@@ -286,9 +259,6 @@ namespace Piwik.Tracker
         /// <summary>
         /// Sets the attribution information to the visit, so that subsequent Goal conversions are
         /// properly attributed to the right Referrer URL, timestamp, Campaign Name and Keyword.
-        ///
-        /// If you call enableCookies() then these referral attribution values will be set
-        /// to the 'ref' first party cookie storing referral information.
         /// </summary>
         /// <param name="attributionInfo">Attribution info for the visit</param>
         /// <see>function getAttributionInfo() in "https://github.com/piwik/piwik/blob/master/js/piwik.js"</see>
@@ -345,9 +315,8 @@ namespace Piwik.Tracker
 
         /// <summary>
         /// Returns the currently assigned Custom Variable.
-        /// If scope is 'visit', it will attempt to read the value set in the first party cookie created by Piwik Tracker ($_COOKIE array).
         /// </summary>
-        /// <param name="id">Custom Variable integer index to fetch from cookie. Should be a value from 1 to 5</param>
+        /// <param name="id">Custom Variable integer index to fetch from. Should be a value from 1 to 5</param>
         /// <param name="scope">Custom variable scope. Possible values: visit, page, event</param>
         /// <returns>
         /// The requested custom variable
@@ -378,14 +347,7 @@ namespace Piwik.Tracker
                 default:
                     throw new ArgumentException("Invalid 'scope' parameter value", nameof(scope));
             }
-
-            var cookieDecoded = GetCustomVariablesFromCookie();
-            if (!cookieDecoded.ContainsKey(stringId)
-                || cookieDecoded[stringId].Count() != 2)
-            {
-                return null;
-            }
-            return new CustomVar(cookieDecoded[stringId][0], cookieDecoded[stringId][1]);
+            return null;
         }
 
         /// <summary>
@@ -436,7 +398,6 @@ namespace Piwik.Tracker
             _randomVisitorId = Guid.NewGuid().ToByteArray().ToSha1().Substring(0, LengthVisitorId);
             _userId = null;
             _forcedVisitorId = null;
-            _cookieVisitorId = null;
         }
 
         /// <summary>
@@ -524,18 +485,6 @@ namespace Piwik.Tracker
         }
 
         /// <summary>
-        /// Enable Cookie Creation - this will cause a first party VisitorId cookie to be set when the VisitorId is set or reset
-        /// </summary>
-        /// <param name="domain">(optional) Set first-party cookie domain. Accepted values: example.com, *.example.com (same as .example.com) or subdomain.example.com</param>
-        /// <param name="path">(optional) Set first-party cookie path</param>
-        public void EnableCookies(string domain = "", string path = "/")
-        {
-            _configCookiesDisabled = false;
-            _configCookieDomain = DomainFixup(domain);
-            _configCookiePath = path;
-        }
-
-        /// <summary>
         /// If image response is disabled Piwik will respond with a HTTP 204 header instead of responding with a gif.
         /// </summary>
         public void DisableSendImageResponse()
@@ -566,22 +515,6 @@ namespace Piwik.Tracker
                 domain = domain.Substring(1);
             }
             return domain;
-        }
-
-        /// <summary>
-        /// Get cookie name with prefix and domain hash
-        /// </summary>
-        /// <param name="cookieName">Name of the cookie.</param>
-        /// <returns></returns>
-        protected string GetCookieName(string cookieName)
-        {
-            // NOTE: If the cookie name is changed, we must also update the method in piwik.js with the same name.
-            var cookieDomain = (string.IsNullOrWhiteSpace(_configCookieDomain)
-                ? GetCurrentHost()
-                : _configCookieDomain)
-                + _configCookiePath;
-            var hash = cookieDomain.ToSha1().Substring(0, 4);
-            return FirstPartyCookiesPrefix + cookieName + "." + IdSite + "." + hash;
         }
 
         /// <summary>
@@ -1176,7 +1109,7 @@ namespace Piwik.Tracker
         /// Rather than letting Piwik attribute the user with a heuristic based on IP and other user fingeprinting attributes,
         /// force the action to be recorded for a particular visitor.
         /// If you use both setVisitorId and setUserId, setUserId will take precedence.
-        /// If not set, the visitor ID will be fetched from the 1st party cookie, or will be set to a random UUID.
+        /// If not set, the visitor ID will be set to a random UUID.
         /// </summary>
         /// <param name="visitorId">16 hexadecimal characters visitor ID, eg. "33c31e01394bdc63"</param>
         /// <exception cref="System.ArgumentException">SetVisitorId() expects a n characters hexadecimal string
@@ -1197,9 +1130,6 @@ namespace Piwik.Tracker
         }
 
         /// <summary>
-        /// If the user initiating the request has the Piwik first party cookie,
-        /// this function will try and return the ID parsed from this first party cookie.
-        ///
         /// If you call this function from a server, where the call is triggered by a cron or script
         /// not initiated by the actual visitor being tracked, then it will return
         /// the random Visitor ID that was assigned to this visit object.
@@ -1217,10 +1147,7 @@ namespace Piwik.Tracker
             {
                 return _forcedVisitorId;
             }
-            if (LoadVisitorIdCookie())
-            {
-                return _cookieVisitorId;
-            }
+
             return _randomVisitorId;
         }
 
@@ -1231,104 +1158,6 @@ namespace Piwik.Tracker
         public string GetUserId()
         {
             return _userId;
-        }
-
-        /// <summary>
-        /// Loads values from the VisitorId Cookie
-        /// </summary>
-        /// <returns>True if cookie exists and is valid, False otherwise</returns>
-        protected bool LoadVisitorIdCookie()
-        {
-            var idCookie = GetCookieMatchingName("id");
-            if (idCookie == default)
-            {
-                return false;
-            }
-            var parts = idCookie.Split('.');
-            if (parts[0].Length != LengthVisitorId)
-            {
-                return false;
-            }
-            _cookieVisitorId = parts[0]; // provides backward compatibility since getVisitorId() didn't change any existing VisitorId value
-            _createTs = long.Parse(parts[1]);
-
-            return true;
-        }
-
-        /// <summary>
-        /// Deletes all first party cookies from the client
-        /// </summary>
-        public void DeleteCookies()
-        {
-            if (_httpContextAccessor.HttpContext != null)
-            {
-                var expire = _currentTs - 86400;
-                var cookies = new[] { "id", "ses", "cvar", "ref" };
-                foreach (var cookie in cookies)
-                {
-                    SetCookie(cookie, "", expire);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Returns the currently assigned Attribution Information stored in a first party cookie.
-        ///
-        /// This function will only work if the user is initiating the current request, and his cookies
-        /// can be read from an active HttpContext.
-        /// </summary>
-        /// <returns>Referrer information for Goal conversion attribution. Will return null if the cookie could not be found</returns>
-        /// <see>Piwik.js getAttributionInfo()</see>
-        public AttributionInfo GetAttributionInfo()
-        {
-            if (_attributionInfo != null)
-            {
-                return _attributionInfo;
-            }
-            var refCookie = GetCookieMatchingName("ref");
-
-            if (refCookie == null)
-            {
-                return null;
-            }
-
-            var cookieDecoded = JsonConvert.DeserializeObject<string[]>(HttpUtility.UrlDecode(refCookie ?? string.Empty));
-
-            if (cookieDecoded == null)
-            {
-                return null;
-            }
-
-            var arraySize = cookieDecoded.Length;
-
-            if (arraySize == 0)
-            {
-                return null;
-            }
-
-            var attributionInfo = new AttributionInfo();
-
-            if (!string.IsNullOrEmpty(cookieDecoded[0]))
-            {
-                attributionInfo.CampaignName = cookieDecoded[0];
-            }
-
-            if (arraySize > 1 && !string.IsNullOrEmpty(cookieDecoded[1]))
-            {
-                attributionInfo.CampaignKeyword = cookieDecoded[1];
-            }
-
-            if (arraySize > 2 && !string.IsNullOrEmpty(cookieDecoded[2]))
-            {
-                attributionInfo.ReferrerTimestamp = DateTimeUtils.UnixEpoch.AddSeconds(Convert.ToInt32(cookieDecoded[2]));
-            }
-
-            if (arraySize > 3 && !string.IsNullOrEmpty(cookieDecoded[3]))
-            {
-                attributionInfo.ReferrerUrl = cookieDecoded[3];
-            }
-
-            return attributionInfo;
         }
 
         /// <summary>
@@ -1367,16 +1196,6 @@ namespace Piwik.Tracker
         }
 
         /// <summary>
-        /// Sets if the browser supports cookies
-        /// This is reported in "List of plugins" report in Piwik.
-        /// </summary>
-        /// <param name="hasCookies">if set to <c>true</c> [has cookies].</param>
-        public void SetBrowserHasCookies(bool hasCookies)
-        {
-            _hasCookies = hasCookies;
-        }
-
-        /// <summary>
         /// Will append a custom string at the end of the Tracking request.
         /// </summary>
         public void SetDebugStringAppend(string debugString)
@@ -1402,15 +1221,6 @@ namespace Piwik.Tracker
                 "&ag=" + (browserPlugins.Silverlight ? "1" : "0");
         }
 
-        /// <summary>
-        /// By default, PiwikTracker will read first party cookies
-        /// from the request and write updated cookies in the response (using setrawcookie).
-        /// This can be disabled by calling this function.
-        /// </summary>
-        public void DisableCookieSupport()
-        {
-            _configCookiesDisabled = true;
-        }
 
         private TrackingResponse SendRequest(string url, Method method = Method.GET, string data = null, bool force = false)
         {
@@ -1468,8 +1278,7 @@ namespace Piwik.Tracker
 
         internal string GetRequest(int idSite)
         {
-            SetFirstPartyCookies();
-
+            
             var customFields = _customParameters.Aggregate("",
                 (current, kvp) => current + $"&{UrlEncode(kvp.Key)}={UrlEncode(kvp.Value)}"
             );
@@ -1497,14 +1306,10 @@ namespace Piwik.Tracker
                     (_forcedNewVisit ? "&new_visit=1" : "") +
                     (!string.IsNullOrEmpty(_tokenAuth) && !_doBulkRequests ? "&token_auth=" + UrlEncode(_tokenAuth) : "") +
 
-                    // Values collected from cookie
-                    "&_idts=" + _createTs +
-
                     // These parameters are set by the JS, but optional when using API
                     (!string.IsNullOrEmpty(_plugins) ? _plugins : "") +
                     (!_localTime.Equals(DateTimeOffset.MinValue) ? "&h=" + _localTime.Hour + "&m=" + _localTime.Minute + "&s=" + _localTime.Second : "") +
                     ((_width != 0 && _height != 0) ? "&res=" + _width + "x" + _height : "") +
-                    (_hasCookies ? "&cookie=1" : "") +
                     (!_ecommerceLastOrderTimestamp.Equals(DateTimeOffset.MinValue) ? "&_ects=" + DateTimeUtils.ConvertToUnixTime(_ecommerceLastOrderTimestamp) : "") +
 
                     // Various important attributes
@@ -1552,27 +1357,6 @@ namespace Piwik.Tracker
             return url;
         }
 
-        private string GetCookieMatchingName(string name)
-        {
-            if (_configCookiesDisabled)
-            {
-                return null;
-            }
-            name = GetCookieName(name);
-
-            if (_httpContextAccessor.HttpContext != null)
-            {
-                var cookies = _httpContextAccessor.HttpContext.Request.Cookies.ToList();
-                for (var i = 0; i < cookies.Count; i++)
-                {
-                    if (cookies[i].Key.Contains(name))
-                    {
-                        return cookies[i].Value;
-                    }
-                }
-            }
-            return null;
-        }
 
         /// <summary>
         /// If current URL is <![CDATA[http://example.org/dir1/dir2/index.php?param1=value1&param2=value2]]>
@@ -1638,71 +1422,6 @@ namespace Piwik.Tracker
                 + GetCurrentHost()
                 + GetCurrentScriptName()
                 + GetCurrentQueryString();
-        }
-
-        /// <summary>
-        /// Sets the first party cookies as would the piwik.js
-        /// All cookies are supported: 'id' and 'ses' and 'ref' and 'cvar' cookies.
-        /// </summary>
-        protected void SetFirstPartyCookies()
-        {
-            if (_configCookiesDisabled)
-            {
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(_cookieVisitorId))
-            {
-                LoadVisitorIdCookie();
-            }
-
-            // Set the 'ref' cookie
-            var attributionInfo = GetAttributionInfo();
-            if (attributionInfo != null)
-            {
-                SetCookie("ref", UrlEncode(JsonConvert.SerializeObject(attributionInfo.ToArray())), ConfigReferralCookieTimeout);
-            }
-
-            // Set the 'ses' cookie
-            SetCookie("ses", "*", ConfigSessionCookieTimeout);
-
-            // Set the 'id' cookie
-            var cookieValue = GetVisitorId() + "." + _createTs;
-            SetCookie("id", cookieValue, ConfigVisitorCookieTimeout);
-
-            // Set the 'cvar' cookie
-            SetCookie("cvar", UrlEncode(JsonConvert.SerializeObject(_visitorCustomVar)), ConfigSessionCookieTimeout);
-        }
-
-        /// <summary>
-        /// Sets a first party cookie to the client to improve dual JS-PHP tracking.
-        /// This replicates the piwik.js tracker algorithms for consistency and better accuracy.
-        /// </summary>
-        /// <param name="cookieName">Name of the cookie.</param>
-        /// <param name="cookieValue">The cookie value.</param>
-        /// <param name="cookieTtl">The cookie TTL.</param>
-        protected void SetCookie(string cookieName, string cookieValue, long cookieTtl)
-        {
-            if (_httpContextAccessor.HttpContext != null)
-            {
-                var cookieExpire = _currentTs + cookieTtl;
-                if(!_httpContextAccessor.HttpContext.Response.HasStarted)
-                    _httpContextAccessor.HttpContext.Response.Cookies.Append(GetCookieName(cookieName), cookieValue, new CookieOptions() { Expires = DateTimeUtils.UnixEpoch.AddSeconds(cookieExpire), Path = _configCookiePath, Domain = _configCookieDomain });
-            }
-        }
-
-        /// <summary>
-        /// Gets the custom variables from cookie.
-        /// </summary>
-        /// <returns></returns>
-        protected Dictionary<string, string[]> GetCustomVariablesFromCookie()
-        {
-            var cookie = GetCookieMatchingName("cvar");
-            if (cookie == null)
-            {
-                return new Dictionary<string, string[]>();
-            }
-            return JsonConvert.DeserializeObject<Dictionary<string, string[]>>(HttpUtility.UrlDecode(cookie ?? string.Empty));
         }
 
         private string FormatDateValue(DateTimeOffset date)
